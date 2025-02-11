@@ -6,18 +6,18 @@ import json
 # -------------------
 # Global Variables
 # -------------------
-ASPECT_RATIO_W = 4      # 4:3 aspect ratio
-ASPECT_RATIO_H = 3
-TARGET_WIDTH   = 960    # final width after resize
-TARGET_HEIGHT  = 720    # final height after resize
+ASPECT_RATIO_W = 4   # e.g. 4 for 4:3
+ASPECT_RATIO_H = 3   # e.g. 3 for 4:3
+TARGET_WIDTH   = 960 # final width after resizing
+TARGET_HEIGHT  = 720 # final height after resizing
 
 # Folder containing your source .mp4 files
 SOURCE_DIR = r"C:\Path\To\Folder"
 
 def get_video_resolution(filename):
     """
-    Use ffprobe (JSON output) to get the width and height of the first video stream.
-    Returns (width, height) as integers, or (None, None) on error.
+    Use ffprobe to extract (width, height) of the first video stream in a file.
+    Returns (None, None) on error.
     """
     cmd = [
         "ffprobe",
@@ -27,7 +27,6 @@ def get_video_resolution(filename):
         "-of", "json",
         filename
     ]
-
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
         data = json.loads(result.stdout)
@@ -37,116 +36,107 @@ def get_video_resolution(filename):
         width = streams[0].get("width")
         height = streams[0].get("height")
         return (width, height)
-    except subprocess.CalledProcessError:
-        return (None, None)
-    except json.JSONDecodeError:
+    except (subprocess.CalledProcessError, json.JSONDecodeError):
         return (None, None)
 
 def build_filter_string(width, height):
     """
-    Given the input width/height, decide if we need to crop to 4:3.
-    Then scale to (TARGET_WIDTH x TARGET_HEIGHT).
-    
-    Returns an FFmpeg -vf filter string, e.g.:
-       "crop=...,scale=960:720"
-    or if it's already 4:3, just 
-       "scale=960:720"
+    Decide if we need to crop to 4:3, then scale to TARGET_WIDTH x TARGET_HEIGHT.
+    Returns an FFmpeg -vf filter string, e.g. "crop=...,scale=960:720" or "scale=960:720"
     """
-    # Convert to float for ratio comparison
     input_ratio = float(width) / float(height)
     desired_ratio = float(ASPECT_RATIO_W) / float(ASPECT_RATIO_H)
-
-    # Small tolerance to consider floating inaccuracies
     EPSILON = 1e-3
 
     if abs(input_ratio - desired_ratio) < EPSILON:
-        # Already 4:3, so no crop needed
+        # Already ~4:3, no crop needed
         filter_str = f"scale={TARGET_WIDTH}:{TARGET_HEIGHT}"
     else:
-        # Need to center-crop to 4:3 first
+        # Need to center-crop to 4:3
         if input_ratio > desired_ratio:
-            # Video is too wide: crop width
+            # Too wide => crop width
             new_width = int(round(height * desired_ratio))
             crop_x = int((width - new_width) / 2)
-            # Example: crop=640:480:40:0 (meaning: crop WxH + x,y)
             filter_str = (
                 f"crop={new_width}:{height}:{crop_x}:0,"
                 f"scale={TARGET_WIDTH}:{TARGET_HEIGHT}"
             )
         else:
-            # Video is too tall: crop height
+            # Too tall => crop height
             new_height = int(round(width / desired_ratio))
             crop_y = int((height - new_height) / 2)
             filter_str = (
                 f"crop={width}:{new_height}:0:{crop_y},"
                 f"scale={TARGET_WIDTH}:{TARGET_HEIGHT}"
             )
-
     return filter_str
 
-def convert_video(input_path):
+def process_file(input_path):
     """
-    1) Get resolution
-    2) Build the filter (crop if needed, then scale to 960x720)
-    3) Run ffmpeg using GPU (h264_nvenc) and copy audio
-    4) Output to new file with _4x3_960x720 in name
+    1) Determine if the video needs cropping.
+    2) Resize to TARGET_WIDTH x TARGET_HEIGHT.
+    3) Use GPU (h264_nvenc) for video encoding, copy audio.
+    4) Overwrite the original by writing to a temp file, then renaming.
     """
     filename = os.path.basename(input_path)
-    name, ext = os.path.splitext(filename)
+    print(f"\nProcessing: {filename}")
 
-    # 1) Get video resolution
+    # 1) Get resolution
     w, h = get_video_resolution(input_path)
     if w is None or h is None:
-        print(f"Could not retrieve resolution for {filename}, skipping.")
+        print(f"  [ERROR] Could not determine resolution. Skipping.")
         return
 
-    # 2) Build the filter string
+    # 2) Build filter string
     vf_string = build_filter_string(w, h)
 
-    # 3) Construct output file path
-    output_path = os.path.join(
-        SOURCE_DIR,
-        f"{name}_4x3_{TARGET_WIDTH}x{TARGET_HEIGHT}{ext}"
-    )
+    # 3) Construct a temporary file path in the same directory
+    temp_path = input_path + ".temp.mp4"
 
-    # 4) FFmpeg command
-    #    -hwaccel cuda               -> use GPU for decoding if possible
-    #    -i input.mp4
-    #    -vf "crop=...,scale=..., etc."  -> do the crop/scale on GPU filters if desired
-    #    -c:v h264_nvenc             -> encode using NVIDIA GPU
-    #    -c:a copy                   -> passthrough audio
-    #
-    # For GPU-based scaling/cropping, you could use scale_npp / crop_cuda filters,
-    # but let's keep it simple with standard filters (they might run partially on CPU).
-    #
-    # If you want everything on GPU, you'd do something like:
-    #   -vf "scale_npp=..., crop=..." 
-    # but that requires custom parameters. The below approach uses normal filters,
-    # which might not be 100% GPU pipeline. But it uses the GPU for encoding.
-    #
-    # If hardware decoding is not supported for your video codec, it may fall back to CPU decode.
+    # 4) ffmpeg command
     cmd = [
         "ffmpeg",
-        "-hwaccel", "cuda",               # try to decode on GPU
+        # Attempt GPU-based decoding
+        "-hwaccel", "cuda",
         "-i", input_path,
+        # Apply our crop+scale filter
         "-vf", vf_string,
-        "-c:v", "h264_nvenc",            # GPU-based H.264 encoder
-        "-c:a", "copy",                  # copy audio
-        "-y",                             # overwrite output if it exists
-        output_path
+        # Use NVENC for video
+        "-c:v", "h264_nvenc",
+        # Copy audio as is
+        "-c:a", "copy",
+        # Overwrite existing output if it exists
+        "-y",
+        temp_path
     ]
 
-    print(f"\nProcessing {filename} -> {os.path.basename(output_path)}")
-    subprocess.run(cmd)
+    # Run FFmpeg
+    result = subprocess.run(cmd)
+
+    # Check if FFmpeg was successful
+    if result.returncode == 0:
+        # Remove the original and rename the temp to original
+        try:
+            os.remove(input_path)
+            os.rename(temp_path, input_path)
+            print(f"  [OK] Overwrote {filename} with 4:3 {TARGET_WIDTH}x{TARGET_HEIGHT}.")
+        except OSError as e:
+            print(f"  [ERROR] Couldn't replace original file: {e}")
+    else:
+        print(f"  [ERROR] FFmpeg failed on {filename}. Return code: {result.returncode}")
+        # Optionally remove temp file if FFmpeg failed
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
 
 def main():
+    # Find all .mp4 files in SOURCE_DIR
     mp4_files = glob.glob(os.path.join(SOURCE_DIR, "*.mp4"))
     if not mp4_files:
         print(f"No .mp4 files found in {SOURCE_DIR}")
         return
 
-    for video_file in mp4_files:
-        convert_video(video_file)
+    for mp4_file in mp4_files:
+        process_file(mp4_file)
 
 if __name__ == "__main__":
     main()
